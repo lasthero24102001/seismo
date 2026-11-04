@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-seismo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seismo}
+      POSTGRES_DB: ${POSTGRES_DB:-seismo}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-seismo} -d ${POSTGRES_DB:-seismo}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-seismo}:${POSTGRES_PASSWORD:-seismo}@db:5432/${POSTGRES_DB:-seismo}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-ChangeMe123!}
+      ADMIN_FULL_NAME: ${ADMIN_FULL_NAME:-Администратор}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+      OCR_ENABLED: ${OCR_ENABLED:-true}
+      OCR_LANG: ${OCR_LANG:-rus+eng}
+      UPLOAD_DIR: /data/uploads
+      BACKUP_DIR: /data/backups
+    volumes:
+      - ./data/uploads:/data/uploads
+      - ./backups:/data/backups
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${APP_PORT:-8080}:80"
+
+volumes:
+  pgdata:
