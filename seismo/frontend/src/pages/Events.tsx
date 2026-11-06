@@ -133,7 +133,7 @@ function EventDialog({ id, onClose, onChanged }: { id: number | null; onClose: (
               </div>
             ) : ev.review_comment && <div className="text-sm"><span className="text-muted-foreground">Комментарий: </span>{ev.review_comment}</div>}
             <div className="space-y-1 border-t pt-3 text-xs text-muted-foreground">
-              <div>Источник: {ev.file_name ?? "—"}{ev.source_row ? `, строка ${ev.source_row}` : ""}{ev.source_no ? `, № ${ev.source_no}` : ""} · импорт {fmtDateTime(ev.created_at)}{ev.updated_at && ` · изменено ${fmtDateTime(ev.updated_at)}`}</div>
+              <div>Источник: {ev.file_name ?? "—"}{ev.source_sheet ? `, лист «${ev.source_sheet}»` : ""}{ev.source_row ? `, строка ${ev.source_row}` : ""}{ev.source_no ? `, № ${ev.source_no}` : ""} · импорт {fmtDateTime(ev.created_at)}{ev.updated_at && ` · изменено ${fmtDateTime(ev.updated_at)}`}</div>
               {ev.raw && <div className="overflow-x-auto rounded bg-muted p-2 font-mono text-[11px]">Исходная строка: {JSON.stringify(ev.raw)}</div>}
             </div>
             {canWrite && (

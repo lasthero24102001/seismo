@@ -2,21 +2,22 @@ import { CheckCircle2, FileUp, Upload, X } from "lucide-react";
 import { useRef, useState } from "react";
 import { ErrorBox, InfoBox, PageHeader, ReasonBadges, Spinner, StatCard } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
+import { Input, Select } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Table, TBody, TD, TH, THead, TR } from "@/components/ui/table";
-import { api } from "@/lib/api";
+import { api, type Station } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { fmtDate, fmtDateTime, fmtNum, fmtSize, fmtTime } from "@/lib/format";
 import { useAsync } from "@/lib/useAsync";
 
-interface PreviewRow { source_row: number; source_no: number | null; status: string; flags: string[]; error: string | null; station: string; event_date: string | null; p_phase: string | null; p_time: string | null; s_time: string | null; origin_time: string | null; s_minus_p: string | null; r_km: string | null; mb: string | null; ml: string | null; ep_vp_vs: string | null }
-interface FileInfo { id: number; original_name: string; file_type: string; size_bytes: number; station_code: string | null; parse_method: string | null; period_start: string | null; period_end: string | null; rows_total: number; rows_imported: number; rows_duplicate: number; rows_error: number; rows_flagged: number; status: string; message: string | null; issue_counts: Record<string, number>; preview?: { rows: PreviewRow[]; truncated: boolean } }
+interface PreviewRow { source_row: number; sheet: string | null; source_no: number | null; status: string; flags: string[]; error: string | null; station: string; event_date: string | null; p_phase: string | null; p_time: string | null; s_time: string | null; origin_time: string | null; s_minus_p: string | null; r_km: string | null; mb: string | null; ml: string | null; ep_vp_vs: string | null }
+interface FileInfo { id: number; original_name: string; file_type: string; size_bytes: number; station_code: string | null; station_hint: string | null; parse_method: string | null; period_start: string | null; period_end: string | null; rows_total: number; rows_imported: number; rows_duplicate: number; rows_error: number; rows_flagged: number; status: string; message: string | null; issue_counts: Record<string, number>; preview?: { rows: PreviewRow[]; truncated: boolean; sheets: string[] } }
 interface Batch { id: number; status: string; created_at: string; committed_at: string | null; created_by: string | null; files_count: number; rows_total: number; rows_imported: number; rows_duplicate: number; rows_error: number; rows_flagged: number; files: FileInfo[] }
 interface Issue { id: number; file_id: number; row_number: number | null; severity: string; code: string; message: string; raw: unknown }
 
 const METHOD: Record<string, string> = { excel: "Excel", pdf_table: "PDF (таблица)", pdf_text: "PDF (текст)", pdf_ocr: "PDF (OCR)" };
-const STATUS: Record<string, [string, "success" | "muted" | "danger" | "warn"]> = { new: ["новая", "success"], dup_in_file: ["копия в файле", "muted"], dup_in_db: ["уже в базе", "muted"], error: ["ошибка", "danger"] };
+const STATUS: Record<string, [string, "success" | "muted" | "danger" | "warn"]> = { new: ["новая", "success"], dup_in_file: ["копия в файле", "muted"], dup_in_db: ["уже в базе", "muted"], dup_sheet: ["дубль с др. листа", "muted"], error: ["ошибка", "danger"] };
 const SEV: Record<string, "danger" | "warn" | "muted"> = { error: "danger", warning: "warn", info: "muted" };
 
 export default function ImportPage() {
@@ -40,7 +41,7 @@ export default function ImportPage() {
   }
   async function cancel() { if (batch) await api.del(`/imports/${batch.id}`).catch(() => undefined); setBatch(null); }
 
-  if (!canWrite) return <><PageHeader title="Импорт данных" /><InfoBox tone="warn">Импорт доступен ролям «Администратор» и «Оператор».</InfoBox><History batches={history.data} /></>;
+  if (!canWrite) return <><PageHeader title="Импорт данных" /><InfoBox tone="warn">Импорт доступен ролям «Администратор» и «Оператор».</InfoBox><History batches={history.data} canWrite={false} onChanged={history.reload} /></>;
   const done = batch?.status === "committed";
   return (
     <>
@@ -78,26 +79,45 @@ export default function ImportPage() {
           <div className="mt-4 flex flex-wrap gap-1.5 border-b">
             {batch.files.map((f, i) => <button key={f.id} onClick={() => setActive(i)} className={`-mb-px border-b-2 px-3 py-2 text-sm ${i === active ? "border-primary font-semibold text-primary" : "border-transparent text-muted-foreground"}`}>{f.station_code ?? "?"} <span className="text-xs">· {f.original_name}</span></button>)}
           </div>
-          <FilePanel batchId={batch.id} f={batch.files[active]} />
+          <FilePanel key={`${batch.files[active].id}-${batch.files[active].station_code}-${batch.status}`} batchId={batch.id} f={batch.files[active]} editable={!done} onBatch={setBatch} />
           <div className="mt-4 flex justify-end gap-2">
             {done ? <Button onClick={() => setBatch(null)}>Загрузить ещё</Button> : <><Button variant="outline" onClick={cancel} disabled={busy}>Отмена</Button><Button onClick={commit} disabled={busy}>{busy ? <Spinner /> : null} Импортировать</Button></>}
           </div>
         </>
       )}
-      <History batches={history.data} />
+      <History batches={history.data} canWrite={canWrite} onChanged={history.reload} />
     </>
   );
 }
 
-function FilePanel({ batchId, f }: { batchId: number; f: FileInfo }) {
+function FilePanel({ batchId, f, editable, onBatch }: { batchId: number; f: FileInfo; editable: boolean; onBatch: (b: Batch) => void }) {
   const [sev, setSev] = useState("");
+  const [sheet, setSheet] = useState(""); const [status, setStatus] = useState("");
+  const [stInput, setStInput] = useState(f.station_hint ?? f.station_code ?? ""); const [stErr, setStErr] = useState<string | null>(null);
+  const stations = useAsync(() => api.get<Station[]>("/stations"), []);
+  async function applyStation(code: string | null) {
+    setStErr(null);
+    try { onBatch(await api.patch<Batch>(`/imports/${batchId}/files/${f.id}`, { station_code: code })); } catch (e) { setStErr((e as Error).message); }
+  }
   const issues = useAsync(() => api.get<{ total: number; items: Issue[] }>(`/imports/${batchId}/issues`, { file_id: f.id, severity: sev, page_size: 200 }), [batchId, f.id, sev, f.status]);
-  const rows = f.preview?.rows ?? [];
+  const all = f.preview?.rows ?? [];
+  const sheets = f.preview?.sheets ?? [];
+  const filtered = all.filter((r) => (!sheet || r.sheet === sheet) && (!status || r.status === status));
+  const rows = filtered.slice(0, 500);
   return (
     <div className="mt-4 space-y-4">
       <Card className="flex flex-wrap items-center gap-x-6 gap-y-2 p-4 text-sm">
         <div><span className="text-muted-foreground">Файл:</span> {f.original_name} ({fmtSize(f.size_bytes)})</div>
-        <div><span className="text-muted-foreground">Станция:</span> <b>{f.station_code ?? "не определена"}</b></div>
+        <div><span className="text-muted-foreground">Станция:</span> <b>{f.station_code ?? "не определена"}</b>{f.station_hint && <span className="text-xs text-muted-foreground"> (задана вручную)</span>}</div>
+        {editable && (
+          <div className="flex items-center gap-1.5">
+            <Input list={`st-${f.id}`} className="h-8 w-28" placeholder="код" value={stInput} onChange={(e) => setStInput(e.target.value.toUpperCase())} />
+            <datalist id={`st-${f.id}`}>{stations.data?.map((x) => <option key={x.code} value={x.code} />)}</datalist>
+            <Button size="sm" variant="outline" disabled={!/^[A-Z][A-Z0-9]{1,7}$/.test(stInput)} onClick={() => applyStation(stInput)}>Задать станцию файлу</Button>
+            {f.station_hint && <Button size="sm" variant="ghost" onClick={() => applyStation(null)}>Авто</Button>}
+          </div>
+        )}
+        {stErr && <Badge variant="danger">{stErr}</Badge>}
         <div><span className="text-muted-foreground">Метод:</span> {f.parse_method ? METHOD[f.parse_method] : "—"}</div>
         <div><span className="text-muted-foreground">Период:</span> {f.period_start ? `${fmtDate(f.period_start)} – ${fmtDate(f.period_end)}` : "—"}</div>
         <div>Строк {f.rows_total} · новых {f.rows_imported} · дубликатов {f.rows_duplicate} · ошибок {f.rows_error} · помечено {f.rows_flagged}</div>
@@ -105,12 +125,17 @@ function FilePanel({ batchId, f }: { batchId: number; f: FileInfo }) {
         {f.rows_total === 0 && !f.message && <Badge variant="muted">В файле нет записей</Badge>}
       </Card>
       {rows.length > 0 && (<>
-        <h3 className="text-sm font-semibold">Записи {f.preview?.truncated && "(показаны первые 1000)"}</h3>
+        <div className="flex flex-wrap items-center gap-3">
+          <h3 className="text-sm font-semibold">Записи ({filtered.length}{f.preview?.truncated ? "+" : ""})</h3>
+          {sheets.length > 1 && <Select className="h-8 w-44" value={sheet} onChange={(e) => setSheet(e.target.value)}><option value="">Все листы ({sheets.length})</option>{sheets.map((x) => <option key={x} value={x}>{x}</option>)}</Select>}
+          <Select className="h-8 w-44" value={status} onChange={(e) => setStatus(e.target.value)}><option value="">Все статусы</option>{Object.entries(STATUS).map(([k, [l]]) => <option key={k} value={k}>{l}</option>)}</Select>
+          {filtered.length > 500 && <span className="text-xs text-muted-foreground">показаны первые 500 — уточните фильтр</span>}
+        </div>
         <div className="max-h-[420px] overflow-auto rounded-md border">
-          <Table><THead><TR><TH>Стр.</TH><TH>Статус</TH><TH>Дата</TH><TH>P</TH><TH>Очаг</TH><TH className="text-right">S-P</TH><TH className="text-right">R</TH><TH className="text-right">Mb</TH><TH className="text-right">ML</TH><TH>Проверка</TH></TR></THead>
+          <Table><THead><TR>{sheets.length > 1 && <TH>Лист</TH>}<TH>Стр.</TH><TH>Статус</TH><TH>Дата</TH><TH>P</TH><TH>Очаг</TH><TH className="text-right">S-P</TH><TH className="text-right">R</TH><TH className="text-right">Mb</TH><TH className="text-right">ML</TH><TH>Проверка</TH></TR></THead>
             <TBody>{rows.map((r) => (
               <TR key={r.source_row} className={r.status === "new" ? (r.flags.length ? "bg-amber-50/60" : "") : "text-muted-foreground"}>
-                <TD>{r.source_row}</TD><TD><Badge variant={STATUS[r.status][1]}>{STATUS[r.status][0]}</Badge></TD>
+                {sheets.length > 1 && <TD>{r.sheet}</TD>}<TD>{r.source_row}</TD><TD><Badge variant={STATUS[r.status][1]}>{STATUS[r.status][0]}</Badge></TD>
                 <TD>{fmtDate(r.event_date)}</TD><TD>{r.p_phase} {fmtTime(r.p_time)}</TD><TD>{fmtTime(r.origin_time)}</TD>
                 <TD className="text-right">{fmtNum(r.s_minus_p === null ? null : Number(r.s_minus_p), 2)}</TD><TD className="text-right">{fmtNum(r.r_km === null ? null : Number(r.r_km), 1)}</TD>
                 <TD className="text-right">{fmtNum(r.mb === null ? null : Number(r.mb), 1)}</TD><TD className="text-right">{fmtNum(r.ml === null ? null : Number(r.ml), 1)}</TD>
@@ -124,15 +149,20 @@ function FilePanel({ batchId, f }: { batchId: number; f: FileInfo }) {
   );
 }
 
-function History({ batches }: { batches: Batch[] | null }) {
+function History({ batches, canWrite, onChanged }: { batches: Batch[] | null; canWrite: boolean; onChanged: () => void }) {
+  async function rollback(b: Batch) {
+    if (!confirm(`Откатить импорт №${b.id}?\n\nБудут удалены все записи, добавленные этим импортом (${b.rows_imported}), включая изменённые вручную. Файлы можно будет импортировать заново.`)) return;
+    try { await api.post(`/imports/${b.id}/rollback`); onChanged(); } catch (e) { alert((e as Error).message); }
+  }
   return (
     <>
       <h2 className="mb-2 mt-8 text-sm font-semibold">История импортов</h2>
-      <Table><THead><TR><TH>№</TH><TH>Дата</TH><TH>Пользователь</TH><TH>Файлы</TH><TH>Строк</TH><TH>Добавлено</TH><TH>Дубликатов</TH><TH>Ошибок</TH><TH>Статус</TH></TR></THead>
+      <Table><THead><TR><TH>№</TH><TH>Дата</TH><TH>Пользователь</TH><TH>Файлы</TH><TH>Строк</TH><TH>Добавлено</TH><TH>Дубликатов</TH><TH>Ошибок</TH><TH>Статус</TH><TH /></TR></THead>
         <TBody>{batches?.map((b) => <TR key={b.id}><TD>{b.id}</TD><TD>{fmtDateTime(b.committed_at ?? b.created_at)}</TD><TD>{b.created_by ?? "—"}</TD>
           <TD className="whitespace-normal">{b.files.map((f) => f.original_name).join(", ")}</TD><TD>{b.rows_total}</TD><TD>{b.rows_imported}</TD><TD>{b.rows_duplicate}</TD><TD>{b.rows_error}</TD>
-          <TD><Badge variant={b.status === "committed" ? "success" : "danger"}>{b.status === "committed" ? "Выполнен" : "Отменён (ошибка)"}</Badge></TD></TR>)}
-          {batches && !batches.length && <TR><TD colSpan={9} className="text-muted-foreground">Импортов ещё не было</TD></TR>}</TBody></Table>
+          <TD><Badge variant={b.status === "committed" ? "success" : b.status === "rolled_back" ? "muted" : "danger"}>{b.status === "committed" ? "Выполнен" : b.status === "rolled_back" ? "Откачен" : "Отменён (ошибка)"}</Badge></TD>
+          <TD>{canWrite && b.status === "committed" && <Button variant="ghost" size="sm" onClick={() => rollback(b)}>Откатить</Button>}</TD></TR>)}
+          {batches && !batches.length && <TR><TD colSpan={10} className="text-muted-foreground">Импортов ещё не было</TD></TR>}</TBody></Table>
     </>
   );
 }

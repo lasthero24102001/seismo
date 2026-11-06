@@ -2,6 +2,7 @@ import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -18,7 +19,7 @@ router = APIRouter(prefix="/api/imports", tags=["imports"])
 
 def _file_out(f: ImportFile) -> dict:
     return {c: getattr(f, c) for c in (
-        "id", "original_name", "file_type", "size_bytes", "station_code", "parse_method", "period_start",
+        "id", "original_name", "file_type", "size_bytes", "station_code", "station_hint", "parse_method", "period_start",
         "period_end", "rows_total", "rows_imported", "rows_duplicate", "rows_error", "rows_flagged", "status",
         "message", "sha256")}
 
@@ -69,6 +70,27 @@ async def preview(request: Request, files: list[UploadFile] = File(...), db: Ses
     return _batch_out(db, db.get(ImportBatch, batch.id), rows=True)
 
 
+class FileStationIn(BaseModel):
+    station_code: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9]{1,7}$")
+
+
+@router.patch("/{batch_id}/files/{file_id}")
+def set_file_station(batch_id: int, file_id: int, data: FileStationIn, request: Request,
+                     db: Session = Depends(get_db), user: User = Depends(can_write)):
+    """Задать станцию файла вручную (если её нет в данных) или сбросить на автоопределение (null)."""
+    batch = db.get(ImportBatch, batch_id)
+    f = db.get(ImportFile, file_id)
+    if not batch or not f or f.batch_id != batch.id:
+        raise HTTPException(404, "Файл импорта не найден")
+    if batch.status != "preview":
+        raise HTTPException(409, "Станцию можно менять только на этапе предпросмотра")
+    f.station_hint = data.station_code.upper() if data.station_code else None
+    importer.refresh_preview(db, batch)
+    audit.log(db, "import_station_set", user, request, "import_file", f.id, {"station": f.station_hint})
+    db.commit()
+    return _batch_out(db, db.get(ImportBatch, batch_id), rows=True)
+
+
 @router.post("/{batch_id}/commit")
 def commit(batch_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(can_write)):
     batch = db.get(ImportBatch, batch_id)
@@ -92,6 +114,21 @@ def commit(batch_id: int, request: Request, db: Session = Depends(get_db), user:
     return _batch_out(db, db.get(ImportBatch, batch_id))
 
 
+@router.post("/{batch_id}/rollback")
+def rollback(batch_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(can_write)):
+    batch = db.get(ImportBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Пакет импорта не найден")
+    try:
+        n = importer.rollback_batch(db, batch)
+        audit.log(db, "import_rollback", user, request, "import_batch", batch.id, {"deleted_events": n})
+        db.commit()
+    except importer.CommitError as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
+    return {"deleted": n, "status": "rolled_back"}
+
+
 @router.delete("/{batch_id}", status_code=204)
 def cancel(batch_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(can_write)):
     batch = db.get(ImportBatch, batch_id)
@@ -107,7 +144,7 @@ def cancel(batch_id: int, request: Request, db: Session = Depends(get_db), user:
 
 @router.get("")
 def history(limit: int = Query(30, ge=1, le=200), db: Session = Depends(get_db), _: User = Depends(current_user)):
-    batches = db.scalars(select(ImportBatch).where(ImportBatch.status.in_(["committed", "failed"]))
+    batches = db.scalars(select(ImportBatch).where(ImportBatch.status.in_(["committed", "failed", "rolled_back"]))
                          .order_by(ImportBatch.id.desc()).limit(limit)).all()
     return [_batch_out(db, b) for b in batches]
 

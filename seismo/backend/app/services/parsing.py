@@ -24,8 +24,8 @@ COLUMNS = ["no", "station", "date", "p_phase", "p_time", "s_phase", "s_time", "o
            "s_minus_p", "r_km", "amp_p", "amp_s", "mb", "ml", "ep_vp", "ep_vs", "ep_vp_vs"]
 N_COLS = len(COLUMNS)
 
-TIME_RE = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})(?:[,.](\d{1,6}))?$")
-DATE_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$")
+TIME_RE = re.compile(r"^(\d{1,2})[:;](\d{2})[:;](\d{2})(?:[,.](\d{1,6}))?$")  # «;» вместо «:» — частая опечатка
+DATE_RE = re.compile(r"^(\d{1,2})[.,](\d{1,2})[.,](\d{4})$")
 
 
 class ParseError(Exception):
@@ -57,6 +57,7 @@ class ParsedRow:
     origin_time: time | None = None
     nums: dict[str, Decimal | None] = field(default_factory=dict)
     flags: list[str] = field(default_factory=list)
+    sheet: str | None = None
 
 
 @dataclass
@@ -64,6 +65,7 @@ class ParsedFile:
     rows: list[ParsedRow]
     issues: list[IssueDraft]
     method: str  # excel | pdf_table | pdf_text | pdf_ocr
+    sheets: list[str] = field(default_factory=list)
 
 
 # ───────────────────────── нормализация значений ─────────────────────────
@@ -135,6 +137,34 @@ def parse_date(v) -> date | None:
     raise ValueError(f"не дата: {v!r}")
 
 
+def _is_xl_error(v) -> bool:
+    return isinstance(v, str) and v.strip().startswith("#")
+
+
+def _secs_decimal(t: time) -> Decimal:
+    whole = t.hour * 3600 + t.minute * 60 + t.second
+    frac = f"{t.microsecond:06d}".rstrip("0") or "0"
+    return Decimal(f"{whole}.{frac}")
+
+
+def parse_sp(v) -> Decimal | None:
+    """S-P в источнике бывает числом (47,75), временем (00:00:45,5 → 45.5 с) или ошибкой Excel (#VALUE!)."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return _secs_decimal(v.time())
+    if isinstance(v, time):
+        return _secs_decimal(v)
+    s = _text(v)
+    if s is None:
+        return None
+    if s.startswith("#"):
+        raise ValueError(f"ошибка Excel {s}")
+    if ":" in s or ";" in s:
+        return _secs_decimal(parse_time(s))
+    return parse_decimal(s)
+
+
 def secs(t: time) -> float:
     return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
 
@@ -169,7 +199,20 @@ def _jsonable(v):
     return v
 
 
-def parse_cells(cells: list, source_row: int, ocr: bool = False) -> ParsedRow:
+def _zeroish(v) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v == 0
+    if isinstance(v, time):
+        return v == time(0, 0, 0)
+    if isinstance(v, str):
+        t = v.strip()
+        return t == "" or t.startswith("#") or t in ("0", "00:00:00", "0:00:00")
+    return False
+
+
+def parse_cells(cells: list, source_row: int, ocr: bool = False, station_required: bool = True) -> ParsedRow:
     cells = list(cells[:N_COLS]) + [None] * max(0, N_COLS - len(cells))
     row = ParsedRow(source_row=source_row, raw=[_jsonable(c) for c in cells])
     c = dict(zip(COLUMNS, cells))
@@ -193,8 +236,11 @@ def parse_cells(cells: list, source_row: int, ocr: bool = False) -> ParsedRow:
         row.event_date = None
         row.error = f"дата: {e}"
     if row.event_date is None and row.error is None:
+        if all(_zeroish(c[f]) for f in TIME_FIELDS):
+            row.kind = "empty"  # остаток формулы: нет даты и ни одного времени — не запись
+            return row
         row.error = "дата отсутствует"
-    if row.station_raw is None:
+    if row.station_raw is None and station_required:
         row.error = (row.error + "; " if row.error else "") + "станция отсутствует"
     if row.error:
         row.kind = "invalid"
@@ -204,13 +250,13 @@ def parse_cells(cells: list, source_row: int, ocr: bool = False) -> ParsedRow:
         try:
             setattr(row, f, parse_time(c[f]))
         except ValueError:
-            row.flags.append(f"parse:{f}")
+            row.flags.append(f"{'excel_error' if _is_xl_error(c[f]) else 'parse'}:{f}")
     for f in NUM_FIELDS:
         try:
-            row.nums[f] = parse_decimal(c[f])
-        except ValueError:
+            row.nums[f] = parse_sp(c[f]) if f == "s_minus_p" else parse_decimal(c[f])
+        except ValueError as e:
             row.nums[f] = None
-            row.flags.append(f"parse:{f}")
+            row.flags.append(f"{'excel_error' if _is_xl_error(c[f]) or 'ошибка Excel' in str(e) else 'parse'}:{f}")
     if ocr:
         row.flags.append("ocr")
     validate_row(row)
@@ -229,7 +275,7 @@ def validate_row(row: ParsedRow) -> None:
 
     for f in ("p_phase", "s_phase", "p_time", "s_time", "origin_time", *NUM_FIELDS):
         val = getattr(row, f, None) if f not in NUM_FIELDS else n.get(f)
-        if val is None and f"parse:{f}" not in fl:
+        if val is None and not any(x in fl for x in (f"parse:{f}", f"excel_error:{f}")):
             fl.append(f"missing:{f}")
 
     p, s, o = row.p_time, row.s_time, row.origin_time
@@ -260,9 +306,84 @@ def validate_row(row: ParsedRow) -> None:
 
 
 # ───────────────────────── Excel ─────────────────────────
+# Колонки сопоставляются по ЗАГОЛОВКАМ (а не по позициям), листов может быть несколько,
+# раскладка листов может отличаться (нет «Станции», нет Ep Vp…, боковые таблицы статистики и т.п.).
 
-def _norm_header(v) -> str:
-    return re.sub(r"\s+", " ", str(v or "")).strip().lower()
+_LOOK = str.maketrans("АВЕКМНОРСТХаекмнортсхв", "ABEKMHOPCTXaekmhoptcxb")  # кириллица-двойники → латиница
+
+
+def _hn(v) -> str:
+    """Нормализация заголовка: двойники кириллица/латиница, регистр, пробелы, точки, запятые, апострофы."""
+    s = str(v if v is not None else "").translate(_LOOK).lower()
+    return re.sub(r"[\s.:,\u00a0'`´’ʻʼ‘]+", "", s)
+
+
+# Заголовки бывают русскими и узбекскими (латиница): «Дата» / «Sana», «P волна» / «P to'lqin» и т.д.
+_H_SINGLE = {
+    "no": {_hn("No"), "№", "n"},
+    "station": {_hn("Станция"), "stansiya", "station"},
+    "date": {_hn("Дата"), "sana", "date"},
+    "s_minus_p": {_hn("S-P")},
+    "r_km": {_hn("R км"), "rkm"},
+    "mb": {_hn("Mb")}, "ml": {_hn("ML")},
+    "ep_vp": {_hn("Ep Vp"), "vp"}, "ep_vs": {_hn("Ep Vs"), "vs"}, "ep_vp_vs": {_hn("Ep Vp/Vs"), "vp/vs"},
+}
+_ORIGIN_PREFIX = (_hn("Время в оч"), "ochoqdagi", "origin")
+_G_P = {_hn("P волна"), "ptolqin"}
+_G_S = {_hn("S волна"), "stolqin"}
+_G_A_PREFIX = (_hn("A в мк/с"), "amplituda", "amplitude")
+_SUB_PHASE = {_hn("Фаза"), "faza", "phase"}
+_SUB_TIME_PREFIX = (_hn("Время"), "vaqt", "time")
+
+
+def _map_columns(h1: list, h2: list) -> dict[str, int]:
+    """Двухстрочная шапка → {поле: индекс колонки}. Неизвестные колонки игнорируются."""
+    cols: dict[str, int] = {}
+    group = None
+    for i in range(max(len(h1), len(h2))):
+        t = _hn(h1[i]) if i < len(h1) else ""
+        sub = _hn(h2[i]) if i < len(h2) else ""
+        if t:
+            group = t
+        elif not sub:
+            group = None
+        field = None
+        if not sub:
+            field = next((k for k, names in _H_SINGLE.items() if t in names), None)
+            if field is None and t.startswith(_ORIGIN_PREFIX):
+                field = "origin_time"
+        elif group in _G_P or group in _G_S:
+            pre = "p" if group in _G_P else "s"
+            field = f"{pre}_phase" if sub in _SUB_PHASE else f"{pre}_time" if sub.startswith(_SUB_TIME_PREFIX) else None
+        elif group and group.startswith(_G_A_PREFIX):
+            field = {"p": "amp_p", "s": "amp_s"}.get(sub)
+        if field and field not in cols:
+            cols[field] = i
+    return cols
+
+
+def _flag_date_outliers(data_rows: list[ParsedRow], window: int = 5, max_days: int = 45) -> int:
+    """Лист обычно идёт по времени. Дата, резко выбивающаяся из соседних строк (напр. 25.04.2025 среди
+    апреля 2026), — вероятная опечатка. Значение НЕ исправляется, запись помечается для проверки."""
+    dated = [r for r in data_rows if r.event_date]
+    if len(dated) < 20:
+        return 0
+    ordinals = [r.event_date.toordinal() for r in dated]
+    ok_pairs = sum(1 for a, b in zip(ordinals, ordinals[1:]) if abs(b - a) <= max_days)
+    if ok_pairs < 0.9 * (len(ordinals) - 1):  # лист не хронологический — проверка неприменима
+        return 0
+    n = 0
+    for i, r in enumerate(dated):
+        near = sorted(ordinals[max(0, i - window):i] + ordinals[i + 1:i + 1 + window])
+        median = near[len(near) // 2]
+        if abs(ordinals[i] - median) > max_days:
+            r.flags.append("date_outlier")
+            n += 1
+    return n
+
+
+_CHECKED = ["p_phase", "p_time", "s_phase", "s_time", "origin_time", *NUM_FIELDS]
+_ERR_PREFIXES = ("missing:", "parse:", "excel_error:")
 
 
 def parse_excel(path: Path) -> ParsedFile:
@@ -272,26 +393,85 @@ def parse_excel(path: Path) -> ParsedFile:
         wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
     except Exception as e:  # noqa: BLE001
         raise ParseError(f"Не удаётся открыть Excel-файл: {e}") from e
-    ws = wb["Бюллетень"] if "Бюллетень" in wb.sheetnames else wb.worksheets[0]
-    all_rows = list(ws.iter_rows(values_only=True))
 
-    header_idx = next((i for i, r in enumerate(all_rows[:15])
-                       if len(r) > 2 and _norm_header(r[1]) == "станция" and _norm_header(r[2]) == "дата"), None)
-    if header_idx is None:
-        raise ParseError("Не найдена шапка таблицы (ожидаются колонки «Станция», «Дата»)")
-    hdr = all_rows[header_idx]
-    if len(hdr) < N_COLS or _norm_header(hdr[7]) != "время в очаге":
-        raise ParseError(f"Неожиданная структура: ожидается {N_COLS} колонок бюллетеня, "
-                         f"найдено {len(hdr)}")
-    start = header_idx + 1
-    if start < len(all_rows) and any(_norm_header(x) == "фаза" for x in all_rows[start]):
-        start += 1
+    rows: list[ParsedRow] = []
+    issues: list[IssueDraft] = []
+    used: list[str] = []
+    for ws in wb.worksheets:
+        data = list(ws.iter_rows(values_only=True))
+        hi = next((i for i, r in enumerate(data[:15]) if any(_hn(c) in _H_SINGLE["date"] for c in r)), None)
+        if hi is None:
+            if any(c is not None for r in data for c in r):
+                issues.append(IssueDraft("warning", "sheet_skipped",
+                                         f"Лист «{ws.title}» пропущен: не найдена шапка таблицы (колонка «Дата»)"))
+            continue
+        nxt = data[hi + 1] if hi + 1 < len(data) else ()
+        has_sub = any(_hn(c) in _SUB_PHASE for c in nxt)
+        cols = _map_columns(list(data[hi]), list(nxt) if has_sub else [])
+        if "date" not in cols or "p_time" not in cols:
+            issues.append(IssueDraft("warning", "sheet_skipped",
+                                     f"Лист «{ws.title}» пропущен: в шапке нет колонок «Дата» и «P волна / Время»"))
+            continue
+        used.append(ws.title)
+        start = hi + (2 if has_sub else 1)
+        order = [cols.get(f) for f in COLUMNS]
+        sheet_rows: list[ParsedRow] = []
+        comma_dates = semicolons = 0
+        for ri in range(start, len(data)):
+            src = data[ri]
+            canon = [src[ix] if ix is not None and ix < len(src) else None for ix in order]
+            pr = parse_cells(canon, ri + 1, station_required=False)  # пустая «Станция» → станция файла
+            pr.raw = [_jsonable(c) for c in src]  # исходная строка целиком, со всеми колонками листа
+            pr.sheet = ws.title
+            if pr.kind == "data" and isinstance(canon[2], str) and "," in canon[2]:
+                comma_dates += 1
+            if pr.kind == "data" and any(isinstance(canon[COLUMNS.index(f)], str) and ";" in canon[COLUMNS.index(f)]
+                                         for f in (*TIME_FIELDS, "s_minus_p")):
+                semicolons += 1
+            sheet_rows.append(pr)
 
-    rows, issues = [], []
-    for idx in range(start, len(all_rows)):
-        pr = parse_cells(list(all_rows[idx]), source_row=idx + 1)
-        rows.append(pr)
-    return ParsedFile(rows=rows, issues=issues, method="excel")
+        data_rows = [r for r in sheet_rows if r.kind == "data"]
+        absent = [f for f in _CHECKED if f not in cols]
+        dead = list(absent)
+        for f in _CHECKED:
+            if f in cols and data_rows:
+                getter = (lambda r, f=f: r.nums.get(f)) if f in NUM_FIELDS else (lambda r, f=f: getattr(r, f))
+                if all(getter(r) is None for r in data_rows):
+                    dead.append(f)
+        for r in sheet_rows:  # «мёртвые» колонки не помечают каждую строку: один вывод на лист
+            if r.flags:
+                r.flags = [x for x in r.flags if not (x.startswith(_ERR_PREFIXES) and x.split(":", 1)[1] in dead)]
+        label = lambda fs: ", ".join(_FIELD_RU.get(f, f) for f in fs)  # noqa: E731
+        if absent:
+            issues.append(IssueDraft("info", "columns_absent",
+                                     f"Лист «{ws.title}»: в таблице нет колонок {label(absent)} — значения не заполняются (NULL)"))
+        empty_cols = [f for f in dead if f not in absent]
+        if empty_cols:
+            issues.append(IssueDraft("warning", "columns_empty",
+                                     f"Лист «{ws.title}»: колонки {label(empty_cols)} пусты или содержат только ошибки "
+                                     f"Excel (#VALUE! и т.п.) во всех {len(data_rows)} строках — значения не импортированы (NULL)"))
+        if comma_dates:
+            issues.append(IssueDraft("info", "date_separator",
+                                     f"Лист «{ws.title}»: {comma_dates} дат записаны как дд,мм,гггг — приведены к дд.мм.гггг"))
+        n_out = _flag_date_outliers(data_rows)
+        if n_out:
+            issues.append(IssueDraft("warning", "date_outliers",
+                                     f"Лист «{ws.title}»: {n_out} зап. с датой, резко выбивающейся из соседних строк "
+                                     f"(возможна опечатка в годе/месяце) — помечены для проверки, дата не менялась"))
+        if semicolons:
+            issues.append(IssueDraft("info", "time_separator",
+                                     f"Лист «{ws.title}»: в {semicolons} строках время записано с «;» вместо «:» "
+                                     f"(например 09:12;37) — приведено к чч:мм:сс, проверьте при необходимости"))
+        rows.extend(sheet_rows)
+
+    if not used:
+        raise ParseError("Не найдено ни одного листа с таблицей бюллетеня (нужна шапка с колонкой «Дата»)")
+    return ParsedFile(rows=rows, issues=issues, method="excel", sheets=used)
+
+
+_FIELD_RU = {"p_phase": "фаза P", "p_time": "время P", "s_phase": "фаза S", "s_time": "время S",
+             "origin_time": "время в очаге", "s_minus_p": "S-P", "r_km": "R км", "amp_p": "A(P)", "amp_s": "A(S)",
+             "mb": "Mb", "ml": "ML", "ep_vp": "Ep Vp", "ep_vs": "Ep Vs", "ep_vp_vs": "Ep Vp/Vs"}
 
 
 # ───────────────────────── PDF ─────────────────────────

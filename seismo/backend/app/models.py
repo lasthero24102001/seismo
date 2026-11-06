@@ -67,6 +67,7 @@ class ImportFile(Base):
     batch_id: Mapped[int] = mapped_column(ForeignKey("import_batches.id", ondelete="CASCADE"), index=True)
     station_id: Mapped[int | None] = mapped_column(ForeignKey("stations.id", ondelete="SET NULL"))
     station_code: Mapped[str | None] = mapped_column(String(16))
+    station_hint: Mapped[str | None] = mapped_column(String(16))  # станция, заданная вручную при импорте
     original_name: Mapped[str] = mapped_column(String(255))
     stored_path: Mapped[str] = mapped_column(String(512))
     sha256: Mapped[str] = mapped_column(String(64), index=True)
@@ -105,6 +106,7 @@ class SeismicEvent(Base):
     file_id: Mapped[int | None] = mapped_column(ForeignKey("import_files.id", ondelete="SET NULL"))
     source_no: Mapped[int | None] = mapped_column(Integer)
     source_row: Mapped[int | None] = mapped_column(Integer)
+    source_sheet: Mapped[str | None] = mapped_column(String(64))
     event_date: Mapped[date] = mapped_column(Date)
     p_phase: Mapped[str | None] = mapped_column(String(8))
     p_time: Mapped[time | None] = mapped_column(TIME(precision=1))

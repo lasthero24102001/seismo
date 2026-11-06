@@ -60,7 +60,7 @@ def _get(db: Session, event_id: int) -> SeismicEvent:
 def get_event(event_id: int, db: Session = Depends(get_db), _: User = Depends(current_user)):
     e = _get(db, event_id)
     d = to_event_out(e)
-    d.update(file_id=e.file_id, source_row=e.source_row, raw=e.raw, record_hash=e.record_hash,
+    d.update(file_id=e.file_id, source_row=e.source_row, source_sheet=e.source_sheet, raw=e.raw, record_hash=e.record_hash,
              created_at=e.created_at, updated_at=e.updated_at,
              file_name=db.scalar(select(ImportFile.original_name).where(ImportFile.id == e.file_id)) if e.file_id else None)
     return d

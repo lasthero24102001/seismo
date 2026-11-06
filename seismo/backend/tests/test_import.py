@@ -45,7 +45,7 @@ def test_commit_all_8_files_no_loss(loaded):
     with SessionLocal() as db:
         assert db.query(ImportIssue).filter_by(code="duplicate_in_file").count() == 65
         assert db.query(ImportIssue).filter_by(code="note_row").count() == 1
-        assert db.query(ImportIssue).filter_by(code="empty_row").count() == 1
+        assert db.query(ImportIssue).filter_by(code="empty_rows").count() == 1  # пустые строки — одной сводной записью
         assert db.query(AuditLog).filter_by(action="import_commit").count() == 1
 
 

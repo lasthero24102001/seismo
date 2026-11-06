@@ -74,5 +74,5 @@ export interface SeismicEvent {
   s_minus_p: number | null; r_km: number | null; amp_p: number | null; amp_s: number | null; mb: number | null; ml: number | null;
   ep_vp: number | null; ep_vs: number | null; ep_vp_vs: number | null; needs_review: boolean; review_reasons: string[]; review_comment: string | null;
 }
-export interface EventDetail extends SeismicEvent { file_id: number | null; file_name: string | null; source_row: number | null; raw: unknown[] | null; record_hash: string; created_at: string; updated_at: string | null }
+export interface EventDetail extends SeismicEvent { file_id: number | null; file_name: string | null; source_row: number | null; source_sheet: string | null; raw: unknown[] | null; record_hash: string; created_at: string; updated_at: string | null }
 export interface Page<T> { items: T[]; total: number; page: number; page_size: number }

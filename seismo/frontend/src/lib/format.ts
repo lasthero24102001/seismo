@@ -24,6 +24,7 @@ const REASONS: Record<string, string> = {
   vel_range: "Скорость Ep Vp/Vs вне допустимого диапазона",
   vpvs_range: "Ep Vp/Vs вне диапазона 1.5–2.1",
   dist_range: "Расстояние более 3000 км",
+  date_outlier: "Дата резко выбивается из соседних записей листа — возможна опечатка (год/месяц)",
   manual: "Помечено вручную",
 };
 export function reasonText(code: string): string {
@@ -31,6 +32,7 @@ export function reasonText(code: string): string {
   const [kind, field] = code.split(":");
   const f = FIELDS[field] ?? field;
   if (kind === "parse") return `Не удалось распознать значение: ${f} (в базе NULL, исходник сохранён)`;
+  if (kind === "excel_error") return `В исходном файле ошибка Excel (#VALUE! и т.п.): ${f} — значение не получено (в базе NULL)`;
   if (kind === "missing") return `Значение отсутствует: ${f}`;
   return code;
 }

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..models import ImportBatch, ImportFile, ImportIssue, SeismicEvent, Station
-from .parsing import NUM_FIELDS, IssueDraft, ParseError, ParsedRow, parse_file, record_hash
+from .parsing import NUM_FIELDS, TIME_FIELDS, IssueDraft, ParseError, ParsedRow, parse_file, record_hash
 
 ALLOWED_EXT = {".xlsx": "xlsx", ".pdf": "pdf"}
 CODE_RE = re.compile(r"^[A-Z][A-Z0-9]{1,7}$")
@@ -55,7 +55,7 @@ class PlannedRow:
     row: ParsedRow
     station_code: str
     hash: str
-    status: str  # new | dup_in_file | dup_in_db | error
+    status: str  # new | dup_in_file | dup_in_db | dup_sheet | error
     flags: list[str] = field(default_factory=list)
 
 
@@ -74,7 +74,7 @@ class FilePlan:
     def counts(self) -> dict:
         c = Counter(p.status for p in self.rows)
         return {"total": len(self.rows), "new": c["new"], "dup_in_file": c["dup_in_file"],
-                "dup_in_db": c["dup_in_db"], "error": c["error"],
+                "dup_in_db": c["dup_in_db"], "dup_sheet": c["dup_sheet"], "error": c["error"],
                 "flagged": sum(1 for p in self.rows if p.status == "new" and p.flags),
                 "service": self.service_rows}
 
@@ -111,7 +111,14 @@ def plan_file(db: Session, f: ImportFile) -> FilePlan:
     by_col = lookup.get(col_major) if col_major else None
     new_station = False
 
-    if by_name:
+    if f.station_hint:  # станция задана пользователем — приоритет над автоопределением
+        hint = lookup.get(f.station_hint.upper())
+        code, new_station = (hint.code, False) if hint else (f.station_hint.upper(), True)
+        issues.append(IssueDraft("info", "station_manual", f"Станция файла задана вручную: {code}"))
+        if new_station:
+            issues.append(IssueDraft("warning", "new_station",
+                                     f"Станция {code} отсутствует в справочнике — будет создана при импорте"))
+    elif by_name:
         code = by_name.code
         if by_col and by_col.code != code:
             issues.append(IssueDraft("warning", "station_conflict",
@@ -145,19 +152,25 @@ def plan_file(db: Session, f: ImportFile) -> FilePlan:
         existing = set(db.scalars(select(SeismicEvent.record_hash).where(SeismicEvent.station_id == st_obj.id)))
 
     planned: list[PlannedRow] = []
-    seen: dict[str, int] = {}
+    seen: dict[str, tuple] = {}          # хеш содержимого → (лист, строка)
+    key_first: dict[tuple, ParsedRow] = {}  # (дата, время P) → первая запись (для дублей между листами)
+    empties: Counter = Counter()
+    multi = len(parsed.sheets) > 1
+    where = lambda r: f"Лист «{r.sheet}», " if multi and r.sheet else ""  # noqa: E731
     service = 0
     for r in parsed.rows:
         if r.kind == "empty":
             service += 1
-            issues.append(IssueDraft("info", "empty_row", "Пустая строка (только номер) — пропущена", r.source_row, r.raw))
+            empties[r.sheet] += 1
             continue
         if r.kind == "note":
             service += 1
-            issues.append(IssueDraft("info", "note_row", f"Служебная строка, не запись: «{r.raw[2]}»", r.source_row, r.raw))
+            issues.append(IssueDraft("info", "note_row", f"{where(r)}служебная строка, не запись: «{r.raw[2]}»",
+                                     r.source_row, r.raw))
             continue
         if r.kind == "invalid":
-            issues.append(IssueDraft("error", "row_invalid", f"Строка не сохранена: {r.error}", r.source_row, r.raw))
+            issues.append(IssueDraft("error", "row_invalid", f"{where(r)}строка не сохранена: {r.error}",
+                                     r.source_row, r.raw))
             planned.append(PlannedRow(r, code, "", "error"))
             continue
         flags = list(r.flags)
@@ -165,19 +178,46 @@ def plan_file(db: Session, f: ImportFile) -> FilePlan:
                 and r.station_raw.upper() != code:
             flags.append("station_mismatch")
         h = record_hash(code, r)
+        key = (r.event_date, r.p_time)
+        first = key_first.get(key) if r.p_time is not None else None
         if h in seen:
+            sh, rw = seen[h]
             issues.append(IssueDraft("warning", "duplicate_in_file",
-                                     f"Точная копия записи из строки {seen[h]} — не сохранена повторно",
-                                     r.source_row, r.raw))
+                                     f"{where(r)}точная копия записи ({'лист «' + sh + '», ' if multi and sh else ''}"
+                                     f"строка {rw}) — не сохранена повторно", r.source_row, r.raw))
             planned.append(PlannedRow(r, code, h, "dup_in_file", flags))
         elif h in existing:
             issues.append(IssueDraft("warning", "duplicate_in_db",
-                                     "Запись уже есть в базе — повторный импорт пропущен", r.source_row, r.raw))
+                                     f"{where(r)}запись уже есть в базе — повторный импорт пропущен",
+                                     r.source_row, r.raw))
             planned.append(PlannedRow(r, code, h, "dup_in_db", flags))
-            seen[h] = r.source_row
+            seen[h] = (r.sheet, r.source_row)
+        elif first is not None and first.sheet != r.sheet:
+            diff = [n for n in (*TIME_FIELDS, *NUM_FIELDS)
+                    if (first.nums.get(n) if n in NUM_FIELDS else getattr(first, n)) !=
+                    (r.nums.get(n) if n in NUM_FIELDS else getattr(r, n))]
+            issues.append(IssueDraft(
+                "warning", "duplicate_other_sheet",
+                f"{where(r)}это же событие (дата + время P) уже взято с листа «{first.sheet}», строка {first.source_row}; "
+                f"сохранена первая версия" + (f", в этой версии отличаются: {', '.join(diff)}" if diff else ""),
+                r.source_row, r.raw))
+            planned.append(PlannedRow(r, code, h, "dup_sheet", flags))
         else:
-            seen[h] = r.source_row
             planned.append(PlannedRow(r, code, h, "new", flags))
+        seen.setdefault(h, (r.sheet, r.source_row))
+        if r.p_time is not None:
+            key_first.setdefault(key, r)
+    for sh, n in empties.items():
+        issues.append(IssueDraft("info", "empty_rows",
+                                 f"{'Лист «' + sh + '»: ' if multi and sh else ''}пустых и шаблонных строк без данных "
+                                 f"(только номер, формулы без значений) пропущено: {n}"))
+    for sh in parsed.sheets:  # сводка по каждому листу
+        st = Counter(p.status for p in planned if p.row.sheet == sh)
+        if multi or st:
+            issues.append(IssueDraft("info", "sheet_summary",
+                                     f"Лист «{sh}»: строк {sum(st.values())} · новых {st['new']} · "
+                                     f"дубликатов {st['dup_in_file'] + st['dup_in_db'] + st['dup_sheet']} · "
+                                     f"ошибок {st['error']}"))
 
     # ── возможные дубли: тот же момент вступления P, но другое содержимое
     groups: dict[tuple, list[PlannedRow]] = defaultdict(list)
@@ -229,7 +269,7 @@ def _apply_plan_stats(f: ImportFile, plan: FilePlan) -> None:
     f.parse_method = plan.method
     f.rows_total = c["total"]
     f.rows_imported = c["new"]
-    f.rows_duplicate = c["dup_in_file"] + c["dup_in_db"]
+    f.rows_duplicate = c["dup_in_file"] + c["dup_in_db"] + c["dup_sheet"]
     f.rows_error = c["error"]
     f.rows_flagged = c["flagged"]
     dates = [p.row.event_date for p in plan.rows if p.row.event_date]
@@ -293,6 +333,7 @@ def commit_batch(db: Session, batch: ImportBatch) -> ImportBatch:
             chunk = rows[i:i + 500]
             values = [{
                 "station_id": st.id, "file_id": f.id, "source_no": p.row.source_no, "source_row": p.row.source_row,
+                "source_sheet": p.row.sheet,
                 "event_date": p.row.event_date, "p_phase": p.row.p_phase, "p_time": p.row.p_time,
                 "s_phase": p.row.s_phase, "s_time": p.row.s_time, "origin_time": p.row.origin_time,
                 **{k: p.row.nums.get(k) for k in NUM_FIELDS},
@@ -316,7 +357,7 @@ def commit_batch(db: Session, batch: ImportBatch) -> ImportBatch:
     return batch
 
 
-def batch_rows_preview(db: Session, batch: ImportBatch, limit: int = 1000) -> dict[int, dict]:
+def batch_rows_preview(db: Session, batch: ImportBatch, limit: int = 3000) -> dict[int, dict]:
     """Строки для предпросмотра (до `limit` на файл)."""
     out: dict[int, dict] = {}
     for f in batch.files:
@@ -325,10 +366,24 @@ def batch_rows_preview(db: Session, batch: ImportBatch, limit: int = 1000) -> di
         for p in plan.rows[:limit]:
             r = p.row
             rows.append({
-                "source_row": r.source_row, "source_no": r.source_no, "status": p.status, "flags": p.flags,
+                "source_row": r.source_row, "source_no": r.source_no, "sheet": r.sheet, "status": p.status, "flags": p.flags,
                 "error": r.error, "station": p.station_code, "event_date": r.event_date,
                 "p_phase": r.p_phase, "p_time": r.p_time, "s_phase": r.s_phase, "s_time": r.s_time,
                 "origin_time": r.origin_time, **{k: r.nums.get(k) for k in NUM_FIELDS}, "raw": r.raw,
             })
-        out[f.id] = {"rows": rows, "truncated": len(plan.rows) > limit}
+        out[f.id] = {"rows": rows, "truncated": len(plan.rows) > limit,
+                     "sheets": sorted({p.row.sheet for p in plan.rows if p.row.sheet})}
     return out
+
+
+def rollback_batch(db: Session, batch: ImportBatch) -> int:
+    """Удаляет все записи, добавленные этим импортом, и помечает пакет «откачен».
+    Вызывающий код делает commit(). Возвращает число удалённых записей."""
+    if batch.status != "committed":
+        raise CommitError("Откатить можно только выполненный импорт")
+    ids = [f.id for f in batch.files]
+    n = db.execute(delete(SeismicEvent).where(SeismicEvent.file_id.in_(ids))).rowcount or 0
+    for f in batch.files:
+        f.status = "rolled_back"
+    batch.status = "rolled_back"
+    return n

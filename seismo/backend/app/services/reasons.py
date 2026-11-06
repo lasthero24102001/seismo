@@ -10,6 +10,7 @@ REASON_LABELS = {
     "vel_range": "Скорость Ep Vp/Vs вне допустимого диапазона",
     "vpvs_range": "Ep Vp/Vs вне диапазона 1.5–2.1",
     "dist_range": "Расстояние более 3000 км",
+    "date_outlier": "Дата резко выбивается из соседних записей листа — возможна опечатка (год/месяц)",
     "manual": "Помечено вручную",
 }
 FIELD_LABELS = {
@@ -26,6 +27,8 @@ def reason_text(code: str) -> str:
     f = FIELD_LABELS.get(field, field)
     if kind == "parse":
         return f"Не удалось распознать значение: {f} (в базе NULL, исходник — в raw)"
+    if kind == "excel_error":
+        return f"В исходном файле ошибка Excel (#VALUE! и т.п.): {f} — значение не получено (в базе NULL)"
     if kind == "missing":
         return f"Значение отсутствует: {f}"
     return code

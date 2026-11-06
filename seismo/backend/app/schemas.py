@@ -125,6 +125,7 @@ class EventDetail(EventOut):
     file_id: int | None
     file_name: str | None = None
     source_row: int | None
+    source_sheet: str | None = None
     raw: list | dict | None
     record_hash: str
     created_at: datetime
