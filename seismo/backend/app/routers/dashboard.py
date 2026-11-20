@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import current_user
 from ..models import ImportBatch, ImportFile, SeismicEvent, Station, User
+from ..schemas import EventOut
 from ..services.queries import to_event_out
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -56,5 +57,5 @@ def dashboard(date_from: date | None = None, date_to: date | None = None, exclud
         "recent_imports": [{"file": f.original_name, "station": f.station_code, "rows_imported": f.rows_imported,
                             "rows_duplicate": f.rows_duplicate, "rows_flagged": f.rows_flagged,
                             "imported_at": at} for f, at in recent_imports],
-        "recent_events": [to_event_out(e) for e in recent_events],
+        "recent_events": [EventOut.model_validate(to_event_out(e)).model_dump(mode="json") for e in recent_events],
     }

@@ -1,17 +1,20 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
 from math import ceil
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import audit
 from ..db import get_db
 from ..deps import can_write, current_user
-from ..models import ImportFile, SeismicEvent, Station, User
+from ..models import AuditLog, ImportFile, SeismicEvent, Station, User
 from ..schemas import EventDetail, EventUpdate, Page
 from ..services.exporter import build_workbook
+from ..services.parsing import NUM_FIELDS, ParsedRow, validate_row
 from ..services.queries import SORTABLE, EventFilter, apply_filters, event_filter, to_event_out
 
 router = APIRouter(prefix="/api/events", tags=["events"])
@@ -66,27 +69,105 @@ def get_event(event_id: int, db: Session = Depends(get_db), _: User = Depends(cu
     return d
 
 
+# Проверки, которые можно пересчитать по самим значениям записи после правки
+VALUE_CHECKS = {"time_order", "sp_mismatch", "mag_range", "amp_range", "vel_range", "vpvs_range", "dist_range",
+                "date_future"}
+
+
+def _fmt(v):
+    """Значение для журнала изменений в читаемом виде."""
+    if v is None:
+        return None
+    if isinstance(v, time):
+        return f"{v:%H:%M:%S}.{v.microsecond // 100000}"
+    if isinstance(v, date):
+        return v.isoformat()
+    if isinstance(v, Decimal):
+        return format(v, "f")
+    return str(v)
+
+
+def recompute_reasons(e: SeismicEvent, old: list[str], changed: set[str]) -> list[str]:
+    """Причины пометки после правки: проверки по значениям пересчитываются заново; «значение отсутствует/не распознано»
+    снимается, если поле теперь заполнено; контекстные пометки (OCR, дубль, выброс даты) сохраняются, пока не изменено
+    то, на чём они основаны. Новые «значение отсутствует» не добавляются."""
+    row = ParsedRow(source_row=0, raw=[], event_date=e.event_date, p_phase=e.p_phase, s_phase=e.s_phase,
+                    p_time=e.p_time, s_time=e.s_time, origin_time=e.origin_time,
+                    nums={f: getattr(e, f) for f in NUM_FIELDS})
+    validate_row(row)
+    keep = []
+    for r in old:
+        if r in VALUE_CHECKS:
+            continue
+        kind, _, fld = r.partition(":")
+        if kind in ("missing", "parse", "excel_error") and fld and getattr(e, fld, None) is not None:
+            continue
+        if r == "date_outlier" and "event_date" in changed:
+            continue
+        if r == "near_duplicate" and {"event_date", "p_time"} & changed:
+            continue
+        keep.append(r)
+    return list(dict.fromkeys(keep + [x for x in row.flags if x in VALUE_CHECKS]))
+
+
 @router.patch("/{event_id}", response_model=EventDetail)
 def update_event(event_id: int, data: EventUpdate, request: Request, db: Session = Depends(get_db),
                  user: User = Depends(can_write)):
     e = _get(db, event_id)
-    changes = {}
-    for field in data.model_fields_set:
+    old_needs, old_reasons = e.needs_review, list(e.review_reasons or [])
+    sent = data.model_fields_set
+    changes: dict = {}
+    for field in sent - {"needs_review", "station_code", "review_comment"}:
         new = getattr(data, field)
+        if isinstance(new, str):
+            new = new.strip() or None
         if field == "event_date" and new is None:
             raise HTTPException(422, "Дата не может быть пустой")
         if getattr(e, field) != new:
-            changes[field] = [str(getattr(e, field)), str(new)]
+            changes[field] = [_fmt(getattr(e, field)), _fmt(new)]
             setattr(e, field, new)
-    if "needs_review" in changes and not e.needs_review:
-        e.review_reasons = []
-    elif e.needs_review and not e.review_reasons:
-        e.review_reasons = ["manual"]
+    if data.station_code:
+        code = data.station_code.strip().upper()
+        st = next((x for x in db.scalars(select(Station)) if code == x.code.upper() or code in (x.aliases or [])), None)
+        if st is None:
+            raise HTTPException(422, f"Станция «{code}» не найдена в справочнике")
+        if st.id != e.station_id:
+            changes["station"] = [e.station.code, st.code]
+            e.station_id, e.station = st.id, st
+    if "review_comment" in sent and (data.review_comment or None) != e.review_comment:
+        changes["review_comment"] = [e.review_comment, data.review_comment or None]
+        e.review_comment = data.review_comment or None
+
+    reasons = recompute_reasons(e, old_reasons, set(changes)) if (set(changes) - {"review_comment"}) else old_reasons
+    if data.needs_review is not None:                    # статус задан пользователем явно
+        needs = data.needs_review
+        reasons = (reasons or ["manual"]) if needs else []
+    else:                                                # иначе — по результату проверок
+        needs = bool(reasons)
+    e.needs_review, e.review_reasons = needs, reasons
+    if (needs, reasons) != (old_needs, old_reasons):
+        changes["needs_review"] = [old_needs, needs]
+        changes["review_reasons"] = [old_reasons, reasons]
+
     if changes:
         e.updated_at, e.updated_by = datetime.now(timezone.utc), user.id
         audit.log(db, "event_updated", user, request, "event", e.id, changes)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "В выбранной станции уже есть точно такая же запись")
     return get_event(event_id, db, user)
+
+
+@router.get("/{event_id}/history")
+def event_history(event_id: int, db: Session = Depends(get_db), _: User = Depends(current_user)):
+    """Кто, когда и что менял в записи (было → стало)."""
+    _get(db, event_id)
+    rows = db.scalars(select(AuditLog).where(
+        AuditLog.entity_type == "event", AuditLog.entity_id == str(event_id), AuditLog.action == "event_updated")
+        .order_by(AuditLog.id.desc()).limit(50)).all()
+    return [{"id": a.id, "created_at": a.created_at, "username": a.username, "changes": a.details or {}} for a in rows]
 
 
 @router.delete("/{event_id}", status_code=204)

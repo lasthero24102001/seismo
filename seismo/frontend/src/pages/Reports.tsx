@@ -1,6 +1,7 @@
 import { Download, FileSpreadsheet } from "lucide-react";
 import { useEffect, useState } from "react";
 import { ErrorBox, InfoBox, PageHeader, Spinner } from "@/components/common";
+import EventDialog from "@/components/EventDialog";
 import { EventsTable } from "@/components/EventsTable";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -22,6 +23,7 @@ export default function Reports() {
   const [layout, setLayout] = useState<"single" | "split">("single");
   const [rep, setRep] = useState<Report | null>(null);
   const [busy, setBusy] = useState(false); const [err, setErr] = useState<string | null>(null);
+  const [openId, setOpenId] = useState<number | null>(null);
   const stations = useAsync(() => api.get<Station[]>("/stations"), []);
 
   useEffect(() => { if (/^\d{4}$/.test(year)) { setFrom(`${year}-01-01`); setTo(`${year}-12-31`); } }, [year]);
@@ -63,15 +65,17 @@ export default function Reports() {
             <div className="mt-1 text-sm text-muted-foreground">Период: {fmtDate(rep.period.date_from)} – {fmtDate(rep.period.date_to)} · Сформирован: {fmtDateTime(rep.generated_at)} · Событий: <b className="text-foreground">{rep.total.toLocaleString("ru-RU")}</b></div>
             <div className="mt-3 flex flex-wrap gap-2 text-xs">{rep.stations.map((s) => <span key={s.code} className="rounded-md border bg-muted px-2 py-1"><b>{s.code}</b>{s.name ? ` · ${s.name}` : ""}: {s.count}</span>)}</div>
           </Card>
+          {rep.total > 0 && <p className="mb-2 text-xs text-muted-foreground">Нажмите на строку — откроется карточка записи: там можно исправить время P, S, время в очаге и другие значения, если в бюллетене ошибка. Отчёт обновится сразу после сохранения.</p>}
           {rep.message && <InfoBox tone="warn">{rep.message}. Проверьте период и выбранные станции — например, импортированные данные могут относиться к другому году.</InfoBox>}
           {rep.truncated && <InfoBox tone="warn">В предпросмотре показаны первые {rep.events.length.toLocaleString("ru-RU")} записей из {rep.total.toLocaleString("ru-RU")}. Файл Excel содержит все записи.</InfoBox>}
-          {rep.total > 0 && (layout === "single" ? <EventsTable events={rep.events} /> : rep.stations.map((s) => {
+          {rep.total > 0 && (layout === "single" ? <EventsTable events={rep.events} onRowClick={(e) => setOpenId(e.id)} /> : rep.stations.map((s) => {
             const ev = rep.events.filter((e) => e.station_code === s.code);
             return <div key={s.code} className="mb-6"><h3 className="mb-2 text-sm font-semibold">{s.code}{s.name ? ` — ${s.name}` : ""} <span className="font-normal text-muted-foreground">({s.count})</span></h3>
-              {ev.length ? <EventsTable events={ev} hideStation /> : <div className="rounded-md border bg-white p-4 text-sm text-muted-foreground">Нет данных за период</div>}</div>;
+              {ev.length ? <EventsTable events={ev} hideStation onRowClick={(e) => setOpenId(e.id)} /> : <div className="rounded-md border bg-white p-4 text-sm text-muted-foreground">Нет данных за период</div>}</div>;
           }))}
         </>
       )}
+      <EventDialog id={openId} onClose={() => setOpenId(null)} onChanged={build} />
     </>
   );
 }

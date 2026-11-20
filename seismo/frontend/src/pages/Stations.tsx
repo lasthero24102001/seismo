@@ -1,7 +1,8 @@
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { ListPlus, Pencil, Plus, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { ErrorBox, PageHeader, Spinner } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
+import { InfoBox } from "@/components/common";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Input, Label } from "@/components/ui/input";
@@ -17,6 +18,13 @@ export default function Stations() {
   const [dlg, setDlg] = useState<Partial<Station> | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [form, setForm] = useState({ code: "", name: "", aliases: "" });
+  const [bulk, setBulk] = useState(false); const [bulkText, setBulkText] = useState("");
+  const [bulkRes, setBulkRes] = useState<{ created: string[]; skipped: { code: string; station: string }[]; invalid: string[] } | null>(null);
+  const [bulkErr, setBulkErr] = useState<string | null>(null);
+  async function addBulk() {
+    setBulkErr(null);
+    try { setBulkRes(await api.post("/stations/bulk", { codes: bulkText })); reload(); } catch (e) { setBulkErr((e as Error).message); }
+  }
 
   const open = (s?: Station) => { setErr(null); setDlg(s ?? {}); setForm({ code: s?.code ?? "", name: s?.name ?? "", aliases: (s?.aliases ?? []).join(", ") }); };
   async function save() {
@@ -35,7 +43,9 @@ export default function Stations() {
   }
   return (
     <>
-      <PageHeader title="Сейсмостанции" subtitle="Справочник станций. Новые станции можно добавлять без изменения кода — также создаются автоматически при импорте" actions={canWrite && <Button onClick={() => open()}><Plus className="h-4 w-4" /> Добавить станцию</Button>} />
+      <PageHeader title="Сейсмостанции" subtitle="Справочник станций. Новые станции можно добавлять без изменения кода — также создаются автоматически при импорте" actions={canWrite && <>
+        <Button variant="outline" onClick={() => { setBulk(true); setBulkText(""); setBulkRes(null); setBulkErr(null); }}><ListPlus className="h-4 w-4" /> Добавить списком</Button>
+        <Button onClick={() => open()}><Plus className="h-4 w-4" /> Добавить станцию</Button></>} />
       <ErrorBox message={error || (dlg ? null : err)} />
       {!data ? <Spinner /> : (
         <Table>
@@ -57,6 +67,27 @@ export default function Stations() {
             </TR>))}</TBody>
         </Table>
       )}
+      <Dialog open={bulk} onOpenChange={setBulk}>
+        <DialogContent title="Добавить станции списком" description="Коды через запятую, пробел или с новой строки. Уже существующие пропускаются.">
+          <ErrorBox message={bulkErr} />
+          {!bulkRes ? (
+            <div className="space-y-3">
+              <textarea className="h-32 w-full rounded-md border border-input p-2 font-mono text-sm uppercase focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                placeholder="SNGR, YANG, TSHT…" value={bulkText} onChange={(e) => setBulkText(e.target.value)} />
+              <div className="text-xs text-muted-foreground">Код — латинские буквы и цифры, начинается с буквы, 2–8 символов. Названия можно задать потом в таблице.</div>
+              <div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setBulk(false)}>Отмена</Button><Button onClick={addBulk} disabled={!bulkText.trim()}>Добавить</Button></div>
+            </div>
+          ) : (
+            <div className="space-y-3 text-sm">
+              <InfoBox>Добавлено станций: <b>{bulkRes.created.length}</b>{bulkRes.created.length > 0 && ` — ${bulkRes.created.join(", ")}`}</InfoBox>
+              {bulkRes.skipped.length > 0 && <div>Уже были в справочнике ({bulkRes.skipped.length}): {bulkRes.skipped.map((x) => x.code === x.station ? x.code : `${x.code} (алиас ${x.station})`).join(", ")}</div>}
+              {bulkRes.invalid.length > 0 && <div className="text-red-700">Некорректные коды, не добавлены: {bulkRes.invalid.join(", ")}</div>}
+              <div className="flex justify-end"><Button onClick={() => setBulk(false)}>Готово</Button></div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={!!dlg} onOpenChange={(o) => !o && setDlg(null)}>
         <DialogContent title={dlg?.id ? `Станция ${dlg.code}` : "Новая станция"}>
           <ErrorBox message={err} />

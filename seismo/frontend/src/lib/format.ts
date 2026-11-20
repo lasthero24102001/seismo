@@ -25,6 +25,8 @@ const REASONS: Record<string, string> = {
   vpvs_range: "Ep Vp/Vs вне диапазона 1.5–2.1",
   dist_range: "Расстояние более 3000 км",
   date_outlier: "Дата резко выбивается из соседних записей листа — возможна опечатка (год/месяц)",
+  date_future: "Дата в будущем — вероятна опечатка (год)",
+  date_time_order: "Время P раньше предыдущей записи при той же дате — возможно, пропущена смена суток (дата неверна)",
   manual: "Помечено вручную",
 };
 export function reasonText(code: string): string {

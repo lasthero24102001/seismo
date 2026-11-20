@@ -133,6 +133,7 @@ class EventDetail(EventOut):
 
 
 class EventUpdate(BaseModel):
+    station_code: str | None = Field(default=None, max_length=8)
     event_date: date | None = None
     p_phase: str | None = Field(default=None, max_length=8)
     s_phase: str | None = Field(default=None, max_length=8)

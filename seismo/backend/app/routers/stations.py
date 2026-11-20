@@ -1,4 +1,7 @@
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -54,6 +57,37 @@ def create_station(data: StationCreate, request: Request, db: Session = Depends(
     audit.log(db, "station_created", user, request, "station", st.id, {"code": code})
     db.commit()
     return st
+
+
+class StationBulk(BaseModel):
+    codes: str = Field(min_length=1, max_length=5000, description="коды через запятую, пробел или перевод строки")
+
+
+@router.post("/bulk")
+def bulk_create(data: StationBulk, request: Request, db: Session = Depends(get_db), user: User = Depends(can_write)):
+    """Добавить несколько станций списком. Существующие пропускаются, некорректные коды возвращаются в ответе."""
+    taken: dict[str, str] = {}
+    for st in db.scalars(select(Station)):
+        taken[st.code.upper()] = st.code
+        for a in st.aliases or []:
+            taken[a.upper()] = st.code
+    created, skipped, invalid, seen = [], [], [], set()
+    for tok in (t for t in re.split(r"[\s,;]+", data.codes.upper()) if t):
+        if tok in seen:
+            continue
+        seen.add(tok)
+        if not re.fullmatch(r"[A-Z][A-Z0-9]{1,7}", tok):
+            invalid.append(tok)
+        elif tok in taken:
+            skipped.append({"code": tok, "station": taken[tok]})
+        else:
+            db.add(Station(code=tok, aliases=[]))
+            taken[tok] = tok
+            created.append(tok)
+    if created:
+        audit.log(db, "stations_bulk_created", user, request, details={"codes": created})
+    db.commit()
+    return {"created": created, "skipped": skipped, "invalid": invalid}
 
 
 @router.patch("/{station_id}", response_model=StationOut)

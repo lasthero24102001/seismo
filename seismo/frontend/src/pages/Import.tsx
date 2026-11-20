@@ -12,7 +12,7 @@ import { fmtDate, fmtDateTime, fmtNum, fmtSize, fmtTime } from "@/lib/format";
 import { useAsync } from "@/lib/useAsync";
 
 interface PreviewRow { source_row: number; sheet: string | null; source_no: number | null; status: string; flags: string[]; error: string | null; station: string; event_date: string | null; p_phase: string | null; p_time: string | null; s_time: string | null; origin_time: string | null; s_minus_p: string | null; r_km: string | null; mb: string | null; ml: string | null; ep_vp_vs: string | null }
-interface FileInfo { id: number; original_name: string; file_type: string; size_bytes: number; station_code: string | null; station_hint: string | null; parse_method: string | null; period_start: string | null; period_end: string | null; rows_total: number; rows_imported: number; rows_duplicate: number; rows_error: number; rows_flagged: number; status: string; message: string | null; issue_counts: Record<string, number>; preview?: { rows: PreviewRow[]; truncated: boolean; sheets: string[] } }
+interface FileInfo { id: number; original_name: string; file_type: string; size_bytes: number; station_code: string | null; station_hint: string | null; station_suggestions?: string[]; parse_method: string | null; period_start: string | null; period_end: string | null; rows_total: number; rows_imported: number; rows_duplicate: number; rows_error: number; rows_flagged: number; status: string; message: string | null; issue_counts: Record<string, number>; preview?: { rows: PreviewRow[]; truncated: boolean; sheets: string[] } }
 interface Batch { id: number; status: string; created_at: string; committed_at: string | null; created_by: string | null; files_count: number; rows_total: number; rows_imported: number; rows_duplicate: number; rows_error: number; rows_flagged: number; files: FileInfo[] }
 interface Issue { id: number; file_id: number; row_number: number | null; severity: string; code: string; message: string; raw: unknown }
 
@@ -43,6 +43,8 @@ export default function ImportPage() {
 
   if (!canWrite) return <><PageHeader title="Импорт данных" /><InfoBox tone="warn">Импорт доступен ролям «Администратор» и «Оператор».</InfoBox><History batches={history.data} canWrite={false} onChanged={history.reload} /></>;
   const done = batch?.status === "committed";
+  const failedFiles = batch ? batch.files.filter((f) => f.status === "failed").length : 0;
+  const allFailed = !!batch && failedFiles === batch.files.length;
   return (
     <>
       <PageHeader title="Импорт данных" subtitle="Загрузка бюллетеней в формате Excel (.xlsx) и PDF, в том числе сканов (OCR). Станция определяется по имени файла и колонке «Станция»" />
@@ -67,7 +69,8 @@ export default function ImportPage() {
 
       {batch && (
         <>
-          {done ? <InfoBox><CheckCircle2 className="mr-1 inline h-4 w-4" /> Импорт завершён: добавлено {batch.rows_imported} записей. Пропущено дубликатов: {batch.rows_duplicate}, ошибок: {batch.rows_error}.</InfoBox>
+          {done && batch.rows_imported === 0 ? <InfoBox tone="warn">Ничего не добавлено в базу. Дубликатов: {batch.rows_duplicate}, ошибок: {batch.rows_error}. Если файл не загрузился, проверьте станцию файла и журнал ниже.</InfoBox>
+            : done ? <InfoBox><CheckCircle2 className="mr-1 inline h-4 w-4" /> Импорт завершён: добавлено {batch.rows_imported} записей. Пропущено дубликатов: {batch.rows_duplicate}, ошибок: {batch.rows_error}.</InfoBox>
             : <InfoBox tone="warn">Предварительный просмотр. В базу ничего ещё не записано — проверьте результат и нажмите «Импортировать».</InfoBox>}
           <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
             <StatCard label="Строк в файлах" value={batch.rows_total} />
@@ -80,8 +83,10 @@ export default function ImportPage() {
             {batch.files.map((f, i) => <button key={f.id} onClick={() => setActive(i)} className={`-mb-px border-b-2 px-3 py-2 text-sm ${i === active ? "border-primary font-semibold text-primary" : "border-transparent text-muted-foreground"}`}>{f.station_code ?? "?"} <span className="text-xs">· {f.original_name}</span></button>)}
           </div>
           <FilePanel key={`${batch.files[active].id}-${batch.files[active].station_code}-${batch.status}`} batchId={batch.id} f={batch.files[active]} editable={!done} onBatch={setBatch} />
+          {!done && allFailed && <InfoBox tone="warn">Импортировать пока нечего: у файла не определена станция (или он не читается). Выберите станцию в жёлтом блоке выше — после этого появятся строки для проверки и кнопка «Импортировать» станет активной.</InfoBox>}
+          {!done && !allFailed && failedFiles > 0 && <InfoBox tone="warn">Файлов, которые будут пропущены из-за ошибок: {failedFiles}. Остальные будут импортированы.</InfoBox>}
           <div className="mt-4 flex justify-end gap-2">
-            {done ? <Button onClick={() => setBatch(null)}>Загрузить ещё</Button> : <><Button variant="outline" onClick={cancel} disabled={busy}>Отмена</Button><Button onClick={commit} disabled={busy}>{busy ? <Spinner /> : null} Импортировать</Button></>}
+            {done ? <Button onClick={() => setBatch(null)}>Загрузить ещё</Button> : <><Button variant="outline" onClick={cancel} disabled={busy}>Отмена</Button><Button onClick={commit} disabled={busy || allFailed}>{busy ? <Spinner /> : null} Импортировать</Button></>}
           </div>
         </>
       )}
@@ -106,6 +111,17 @@ function FilePanel({ batchId, f, editable, onBatch }: { batchId: number; f: File
   const rows = filtered.slice(0, 500);
   return (
     <div className="mt-4 space-y-4">
+      {editable && !f.station_code && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950">
+          <div className="font-semibold">Станция файла не определена — без неё файл не будет импортирован.</div>
+          <div className="mt-1">Выберите станцию{(f.station_suggestions?.length ?? 0) > 0 ? " (подобрана по названию файла)" : ""} или впишите код ниже и нажмите «Задать станцию файлу»:</div>
+          {(f.station_suggestions?.length ?? 0) > 0 && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {f.station_suggestions!.map((c) => <Button key={c} size="sm" onClick={() => applyStation(c)}>Использовать {c}</Button>)}
+            </div>
+          )}
+        </div>
+      )}
       <Card className="flex flex-wrap items-center gap-x-6 gap-y-2 p-4 text-sm">
         <div><span className="text-muted-foreground">Файл:</span> {f.original_name} ({fmtSize(f.size_bytes)})</div>
         <div><span className="text-muted-foreground">Станция:</span> <b>{f.station_code ?? "не определена"}</b>{f.station_hint && <span className="text-xs text-muted-foreground"> (задана вручную)</span>}</div>

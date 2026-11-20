@@ -26,6 +26,21 @@ class UploadRejected(Exception):
 
 # ───────────────────────── проверка и сохранение загрузки ─────────────────────────
 
+def suggest_stations(codes: list[str], filename: str) -> list[str]:
+    """Подсказка станции по имени файла (agalik → AGAL). Только подсказка: пользователь подтверждает сам."""
+    words = {w.upper() for w in re.findall(r"[A-Za-z]{3,8}", Path(filename).stem)}
+    out = [c for c in sorted(codes) if len(c) >= 3 and any(w.startswith(c.upper()) or (len(w) >= 4 and c.upper().startswith(w))
+                                                           for w in words)]
+    return out[:5]
+
+
+def guess_station(codes: list[str], filename: str) -> str | None:
+    """Уверенное совпадение имени файла со станцией: единственный кандидат и код не короче 4 символов
+    (agalik → AGAL). Короткие коды (NAN, NUR…) только предлагаются, но сами не подставляются."""
+    sug = suggest_stations(codes, filename)
+    return sug[0] if len(sug) == 1 and len(sug[0]) >= 4 else None
+
+
 def safe_name(name: str) -> str:
     base = Path(name.replace("\\", "/")).name
     return re.sub(r"[^\w.\- ()А-Яа-яЁё]", "_", base)[:200] or "file"
@@ -134,8 +149,15 @@ def plan_file(db: Session, f: ImportFile) -> FilePlan:
         code, new_station = file_tok, True
         issues.append(IssueDraft("warning", "new_station",
                                  f"Станция {code} (по имени файла) отсутствует в справочнике — будет создана"))
+    elif (guess := guess_station(sorted({st.code for st in lookup.values()}), f.original_name)):
+        code = guess
+        issues.append(IssueDraft("warning", "station_guessed",
+                                 f"Станция определена по названию файла «{Path(f.original_name).stem[:40]}» → {code}. "
+                                 f"Проверьте; если это не та станция — задайте нужную вручную"))
     else:
-        msg = "Не удалось определить станцию ни по имени файла, ни по колонке «Станция»"
+        n_rows = sum(1 for r in data_rows if r.event_date or r.p_time)
+        msg = ("Не удалось определить станцию ни по имени файла, ни по колонке «Станция»"
+               + (f". В файле найдено строк с данными: {n_rows} — укажите станцию вручную, и они будут проверены" if n_rows else ""))
         return FilePlan(f, None, False, parsed.method, [], issues + [IssueDraft("error", "no_station", msg)], 0, msg)
 
     # алиас: код в данных отличается от кода станции, но известен как её алиас
@@ -316,6 +338,9 @@ def commit_batch(db: Session, batch: ImportBatch) -> ImportBatch:
     if batch.status != "preview":
         raise CommitError("Пакет уже обработан")
     plans = refresh_preview(db, batch)  # свежее состояние БД (защита от гонок/повторов)
+    if all(p.fatal for p in plans):
+        raise CommitError("Импортировать нечего: у файлов не определена станция или они не читаются. "
+                          "Укажите станцию файла в предпросмотре")
     imported_total = 0
     for plan in plans:
         f = plan.file
@@ -337,7 +362,7 @@ def commit_batch(db: Session, batch: ImportBatch) -> ImportBatch:
                 "event_date": p.row.event_date, "p_phase": p.row.p_phase, "p_time": p.row.p_time,
                 "s_phase": p.row.s_phase, "s_time": p.row.s_time, "origin_time": p.row.origin_time,
                 **{k: p.row.nums.get(k) for k in NUM_FIELDS},
-                "needs_review": bool(p.flags), "review_reasons": p.flags, "raw": p.row.raw, "record_hash": p.hash,
+                "needs_review": bool(p.flags), "review_reasons": p.flags, "review_comment": p.row.note, "raw": p.row.raw, "record_hash": p.hash,
             } for p in chunk]
             stmt = pg_insert(SeismicEvent).values(values).on_conflict_do_nothing(
                 index_elements=["station_id", "record_hash"]).returning(SeismicEvent.record_hash)

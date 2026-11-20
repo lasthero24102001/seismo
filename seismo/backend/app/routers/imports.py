@@ -10,7 +10,7 @@ from .. import audit
 from ..config import get_settings
 from ..db import get_db
 from ..deps import can_write, current_user
-from ..models import ImportBatch, ImportFile, ImportIssue, User
+from ..models import ImportBatch, ImportFile, ImportIssue, Station, User
 from ..services import importer
 from ..services.parsing import NUM_FIELDS
 
@@ -30,6 +30,7 @@ def _batch_out(db: Session, b: ImportBatch, rows: bool = False) -> dict:
                                   .where(ImportIssue.batch_id == b.id).group_by(ImportIssue.file_id, ImportIssue.severity)):
         issues_by_file.setdefault(fid, {})[sev] = n
     previews = importer.batch_rows_preview(db, b) if rows and b.status == "preview" else {}
+    codes = [c for (c,) in db.execute(select(Station.code))] if any(f.station_code is None for f in b.files) else []
     user = db.get(User, b.created_by) if b.created_by else None
     return {
         "id": b.id, "status": b.status, "created_at": b.created_at, "committed_at": b.committed_at,
@@ -37,6 +38,7 @@ def _batch_out(db: Session, b: ImportBatch, rows: bool = False) -> dict:
         "rows_total": b.rows_total, "rows_imported": b.rows_imported, "rows_duplicate": b.rows_duplicate,
         "rows_error": b.rows_error, "rows_flagged": b.rows_flagged,
         "files": [{**_file_out(f), "issue_counts": issues_by_file.get(f.id, {}),
+                   "station_suggestions": importer.suggest_stations(codes, f.original_name) if f.station_code is None else [],
                    **({"preview": previews.get(f.id)} if rows else {})} for f in b.files],
     }
 

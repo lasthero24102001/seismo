@@ -10,6 +10,7 @@ from ..db import get_db
 from ..deps import current_user
 from ..models import SeismicEvent, Station, User
 from ..services.exporter import build_workbook
+from ..schemas import EventOut
 from ..services.queries import EventFilter, apply_filters, to_event_out
 from .events import XLSX
 
@@ -56,7 +57,7 @@ def report(year: int | None = Query(None, ge=1900, le=2200), date_from: date | N
         "period": {"year": year, "date_from": d0, "date_to": d1},
         "generated_at": datetime.now(), "total": total, "truncated": total > len(events),
         "stations": [{"code": s.code, "name": s.name, "count": counts.get(s.code, 0)} for s in sts],
-        "events": [to_event_out(e) for e in events],
+        "events": [EventOut.model_validate(to_event_out(e)).model_dump(mode="json") for e in events],
         "message": None if total else "За выбранный период данных по выбранным станциям нет",
     }
 

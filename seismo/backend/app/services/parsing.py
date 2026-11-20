@@ -13,7 +13,7 @@ import hashlib
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -58,6 +58,7 @@ class ParsedRow:
     nums: dict[str, Decimal | None] = field(default_factory=dict)
     flags: list[str] = field(default_factory=list)
     sheet: str | None = None
+    note: str | None = None  # пояснение к записи (сохраняется как комментарий)
 
 
 @dataclass
@@ -212,7 +213,8 @@ def _zeroish(v) -> bool:
     return False
 
 
-def parse_cells(cells: list, source_row: int, ocr: bool = False, station_required: bool = True) -> ParsedRow:
+def parse_cells(cells: list, source_row: int, ocr: bool = False, station_required: bool = True,
+                allow_missing_date: bool = False) -> ParsedRow:
     cells = list(cells[:N_COLS]) + [None] * max(0, N_COLS - len(cells))
     row = ParsedRow(source_row=source_row, raw=[_jsonable(c) for c in cells])
     c = dict(zip(COLUMNS, cells))
@@ -239,7 +241,8 @@ def parse_cells(cells: list, source_row: int, ocr: bool = False, station_require
         if all(_zeroish(c[f]) for f in TIME_FIELDS):
             row.kind = "empty"  # остаток формулы: нет даты и ни одного времени — не запись
             return row
-        row.error = "дата отсутствует"
+        if not (allow_missing_date and _text(c["date"]) is None):   # пустую дату решает вызывающий код (см. _fill_missing_dates)
+            row.error = "дата отсутствует"
     if row.station_raw is None and station_required:
         row.error = (row.error + "; " if row.error else "") + "станция отсутствует"
     if row.error:
@@ -300,6 +303,8 @@ def validate_row(row: ParsedRow) -> None:
         fl.append("vel_range")
     if vr is not None and not Decimal("1.5") <= vr <= Decimal("2.1"):
         fl.append("vpvs_range")
+    if row.event_date and row.event_date > date.today() + timedelta(days=1):
+        fl.append("date_future")
     if n.get("r_km") is not None and n["r_km"] > 3000:
         fl.append("dist_range")
     row.flags = list(dict.fromkeys(fl))
@@ -362,24 +367,78 @@ def _map_columns(h1: list, h2: list) -> dict[str, int]:
     return cols
 
 
-def _flag_date_outliers(data_rows: list[ParsedRow], window: int = 5, max_days: int = 45) -> int:
-    """Лист обычно идёт по времени. Дата, резко выбивающаяся из соседних строк (напр. 25.04.2025 среди
-    апреля 2026), — вероятная опечатка. Значение НЕ исправляется, запись помечается для проверки."""
+_NOTE_DATE = ("Дата в файле не указана: взята из ближайшей строки выше "
+              "(на этом листе дата проставлена один раз на сутки; порядок времён подтверждает ту же дату)")
+
+
+def _fill_missing_dates(rows: list[ParsedRow]) -> tuple[int, int]:
+    """Некоторые листы пишут дату один раз в первой строке суток, у остальных строк ячейка пуста.
+    Дата восстанавливается из ближайшей строки выше ТОЛЬКО если время P не идёт назад (то есть сутки не сменились).
+    Если цепочка начинается со строки, где время уже «откатилось» при той же дате (потеряна граница суток),
+    строки цепочки помечаются `date_time_order`. Иначе строка остаётся ошибкой. Возвращает (восстановлено, не удалось)."""
+    prev: ParsedRow | None = None
+    anchor: ParsedRow | None = None   # явная строка, у которой время откатилось при той же дате
+    anchor_flagged = False
+    filled = unresolved = 0
+    for r in rows:
+        if r.kind != "data":
+            continue
+        if r.event_date is not None:
+            anchor = r if (prev is not None and prev.event_date == r.event_date and prev.p_time and r.p_time
+                           and r.p_time < prev.p_time) else None
+            anchor_flagged = False
+            prev = r
+            continue
+        if prev is None or prev.p_time is None or r.p_time is None or r.p_time < prev.p_time:
+            r.kind, r.error = "invalid", "дата отсутствует" + (
+                " (время раньше предыдущей записи — смена суток не определена)" if prev is not None else "")
+            unresolved += 1
+            continue
+        r.event_date, r.note = prev.event_date, _NOTE_DATE
+        if anchor is not None:
+            if not anchor_flagged:
+                anchor.flags.append("date_time_order")
+                anchor_flagged = True
+            r.flags.append("date_time_order")
+        validate_row(r)
+        r.flags = list(dict.fromkeys(r.flags))
+        prev = r
+        filled += 1
+    return filled, unresolved
+
+
+def _flag_date_outliers(data_rows: list[ParsedRow], max_gap: int = 45) -> int:
+    """Лист идёт по времени. Строки режутся на серии: новая серия начинается, когда дата скачет более чем на
+    `max_gap` дней. Малая серия, оторванная от основной хронологии (напр. 12 строк «07.01.2026» посреди августа,
+    блок «01,03,2025» в начале марта, «27.02.2027…2041»), — вероятная опечатка в дате. Значение НЕ исправляется,
+    записи помечаются для проверки."""
     dated = [r for r in data_rows if r.event_date]
-    if len(dated) < 20:
+    n = len(dated)
+    if n < 20:
         return 0
-    ordinals = [r.event_date.toordinal() for r in dated]
-    ok_pairs = sum(1 for a, b in zip(ordinals, ordinals[1:]) if abs(b - a) <= max_days)
-    if ok_pairs < 0.9 * (len(ordinals) - 1):  # лист не хронологический — проверка неприменима
+    ords = [r.event_date.toordinal() for r in dated]
+    segs, start = [], 0
+    for i in range(1, n):
+        if abs(ords[i] - ords[i - 1]) > max_gap:
+            segs.append((start, i))
+            start = i
+    segs.append((start, n))
+    if len(segs) == 1 or len(segs) > max(3, n // 10):   # нет разрывов / лист не хронологический — не применимо
         return 0
-    n = 0
-    for i, r in enumerate(dated):
-        near = sorted(ordinals[max(0, i - window):i] + ordinals[i + 1:i + 1 + window])
-        median = near[len(near) // 2]
-        if abs(ordinals[i] - median) > max_days:
-            r.flags.append("date_outlier")
-            n += 1
-    return n
+    small = max(30, int(0.05 * n))
+    big = [(s_, e_) for s_, e_ in segs if e_ - s_ > small]
+    if not big:
+        return 0
+    lo = min(min(ords[s_:e_]) for s_, e_ in big) - max_gap     # диапазон основной хронологии листа ± допуск
+    hi = max(max(ords[s_:e_]) for s_, e_ in big) + max_gap
+    flagged = 0
+    for s_, e_ in segs:
+        if e_ - s_ <= small:
+            for i in range(s_, e_):
+                if not lo <= ords[i] <= hi:   # малая серия внутри диапазона (напр. хвост 28.02) — не выброс
+                    dated[i].flags.append("date_outlier")
+                    flagged += 1
+    return flagged
 
 
 _CHECKED = ["p_phase", "p_time", "s_phase", "s_time", "origin_time", *NUM_FIELDS]
@@ -420,7 +479,7 @@ def parse_excel(path: Path) -> ParsedFile:
         for ri in range(start, len(data)):
             src = data[ri]
             canon = [src[ix] if ix is not None and ix < len(src) else None for ix in order]
-            pr = parse_cells(canon, ri + 1, station_required=False)  # пустая «Станция» → станция файла
+            pr = parse_cells(canon, ri + 1, station_required=False, allow_missing_date=True)  # пустые «Станция»/«Дата» решаем ниже
             pr.raw = [_jsonable(c) for c in src]  # исходная строка целиком, со всеми колонками листа
             pr.sheet = ws.title
             if pr.kind == "data" and isinstance(canon[2], str) and "," in canon[2]:
@@ -430,6 +489,11 @@ def parse_excel(path: Path) -> ParsedFile:
                 semicolons += 1
             sheet_rows.append(pr)
 
+        n_filled, n_unres = _fill_missing_dates(sheet_rows)
+        if n_filled:
+            issues.append(IssueDraft("warning", "date_inferred",
+                                     f"Лист «{ws.title}»: у {n_filled} строк ячейка «Дата» пуста — дата взята из ближайшей строки выше "
+                                     f"(дата проставлена один раз на сутки, порядок времён это подтверждает). Пояснение — в комментарии записи"))
         data_rows = [r for r in sheet_rows if r.kind == "data"]
         absent = [f for f in _CHECKED if f not in cols]
         dead = list(absent)
